@@ -99,6 +99,63 @@ final class CandyGrantEvaluationTests: XCTestCase {
         XCTAssertEqual(epochs["claude.fiveHour"], "2026-09-17T15:00:00Z")
     }
 
+    /// Claude's `resets_at` for one window changes its fractional part on every fetch (request
+    /// microseconds). Retrying a prompt at the limit refreshed limits and granted a candy each time.
+    func testJitteredClaudeResetsAtIsSameWindow() {
+        var tier: [String: Int] = [:]
+        var epochs: [String: String] = [:]
+        let first = CompanionStore.evaluateCandyGrants(
+            windows: [w("claude.fiveHour", .session, 100, epoch: "2026-09-28T15:10:00.403883+00:00")],
+            grantTier: &tier, windowEpoch: &epochs)
+        XCTAssertEqual(first.map(\.count), [1])
+
+        for jittered in ["2026-09-28T15:10:00.911204+00:00",
+                         "2026-09-28T15:09:59.998+00:00",
+                         "2026-09-28T15:10:01.000017+00:00"] {
+            let again = CompanionStore.evaluateCandyGrants(
+                windows: [w("claude.fiveHour", .session, 100, epoch: jittered)],
+                grantTier: &tier, windowEpoch: &epochs)
+            XCTAssertTrue(again.isEmpty, "same window, jittered resets_at \(jittered) must not regrant")
+        }
+        XCTAssertEqual(epochs["claude.fiveHour"], "2026-09-28T15:10:00.403883+00:00",
+                       "anchor stays on the window's first epoch")
+    }
+
+    func testJitteredCodexResetUnixIsSameWindow() {
+        var tier: [String: Int] = [:]
+        var epochs: [String: String] = [:]
+        _ = CompanionStore.evaluateCandyGrants(
+            windows: [w("codex.codex.primary", .session, 100, epoch: "1790604844")],
+            grantTier: &tier, windowEpoch: &epochs)
+        let again = CompanionStore.evaluateCandyGrants(
+            windows: [w("codex.codex.primary", .session, 100, epoch: "1790604845")],
+            grantTier: &tier, windowEpoch: &epochs)
+        XCTAssertTrue(again.isEmpty)
+    }
+
+    /// #326 must survive the tolerance: a real next window, jitter included, still re-arms at 100%.
+    func testNextWindowWithJitterStillRearms() {
+        var tier: [String: Int] = [:]
+        var epochs: [String: String] = [:]
+        _ = CompanionStore.evaluateCandyGrants(
+            windows: [w("claude.fiveHour", .session, 100, epoch: "2026-09-28T15:10:00.403883+00:00")],
+            grantTier: &tier, windowEpoch: &epochs)
+        let next = CompanionStore.evaluateCandyGrants(
+            windows: [w("claude.fiveHour", .session, 100, epoch: "2026-09-28T20:10:00.120931+00:00")],
+            grantTier: &tier, windowEpoch: &epochs)
+        XCTAssertEqual(next.map(\.count), [1])
+        XCTAssertEqual(epochs["claude.fiveHour"], "2026-09-28T20:10:00.120931+00:00")
+    }
+
+    func testCandyWindowIdentityTolerance() {
+        let t = CompanionStore.candyEpochTolerance
+        let base = 1_790_604_844.0
+        XCTAssertFalse(CompanionStore.isNewCandyWindow(previous: "\(Int(base))", current: "\(Int(base + t))"))
+        XCTAssertTrue(CompanionStore.isNewCandyWindow(previous: "\(Int(base))", current: "\(Int(base + t + 1))"))
+        XCTAssertTrue(CompanionStore.isNewCandyWindow(previous: "E1", current: "E2"), "unparseable falls back to string compare")
+        XCTAssertFalse(CompanionStore.isNewCandyWindow(previous: "E1", current: "E1"))
+    }
+
     /// epoch 를 처음 알게 된 것만으로 재지급하지 않는다(구세이브 → 신규 필드 도입 시 폭탄 방지).
     func testLearningEpochForFirstTimeDoesNotRegrant() {
         var tier: [String: Int] = ["claude.fiveHour": 1]
@@ -185,6 +242,22 @@ final class RareCandyStoreTests: XCTestCase {
         s.grantCandies(from: [w("claude.fiveHour", .session, 100, epoch: "E2")], limitsReady: true)
         XCTAssertEqual(s.rareCandyCount, 1, "새 epoch + 100% → 지급")
         XCTAssertEqual(s.state.candyWindowEpoch["claude.fiveHour"], "E2")
+    }
+
+    /// Reported: hit the 5h limit → one candy, then every retried prompt (refresh with a fresh
+    /// `resets_at` fractional part) granted another.
+    func testRetryingAtLimitGrantsOnlyOnce() {
+        let s = store(rcLinear3)
+        s.grantCandies(from: [w("claude.fiveHour", .session, 80,
+                                epoch: "2026-09-28T15:10:00.100000+00:00")], limitsReady: true)   // seed
+        s.grantCandies(from: [w("claude.fiveHour", .session, 100,
+                                epoch: "2026-09-28T15:10:00.403883+00:00")], limitsReady: true)
+        XCTAssertEqual(s.rareCandyCount, 1)
+        for micros in ["512001", "733950", "998812"] {
+            s.grantCandies(from: [w("claude.fiveHour", .session, 100,
+                                    epoch: "2026-09-28T15:10:00.\(micros)+00:00")], limitsReady: true)
+        }
+        XCTAssertEqual(s.rareCandyCount, 1, "retries inside the same window must not grant again")
     }
 
     /// 시드+지급 헬퍼 — 빈 창으로 시드 완료 후, 유니크 세션 창을 100%로 올려 n개 지급.

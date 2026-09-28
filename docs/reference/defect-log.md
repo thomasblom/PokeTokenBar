@@ -875,6 +875,18 @@ read_when:
   아니다(구세이브 업그레이드 폭탄 방지). 회귀: `testRearmWhenWindowEpochAdvancesWhileStillAt100`·
   `testGrantAfterSeedWhenEpochAdvancesWithoutUtilDip`·`testLearningEpochForFirstTimeDoesNotRegrant`.
 
+- **epoch 는 문자열로 비교하지 마라 — 같은 창도 fetch 마다 값이 흔들린다.** #326 수정은
+  `previousEpoch != epoch` 로 재무장했는데, Claude `resets_at` 은 창 경계에 *요청 시각의 마이크로초*가
+  붙어(`…15:10:00.403883+00:00`) 매 fetch 문자열이 다르고 Codex reset unix 도 초 단위로 흔들린다.
+  100% 인 동안 refresh(한도 도달 후 프롬프트 재시도가 곧 refresh)마다 재무장→재지급돼 Rare Candy 가
+  반복 지급됐다. 테스트가 못 거른 이유: 전부 `"E1"`/`"E2"` 같은 합성 epoch 라 "같은 창 = 같은 문자열"을
+  전제했고, 실 API 모양(같은 창·다른 소수부)을 한 번도 넣지 않았다. 해결:
+  `CompanionStore.isNewCandyWindow` — 날짜로 파싱해 `candyEpochTolerance`(1h, 최단 지급 창 5h 보다
+  훨씬 작음)를 넘게 움직일 때만 새 창, 저장 epoch 는 새 창일 때만 갱신(앵커). 회귀:
+  `testJitteredClaudeResetsAtIsSameWindow`·`testJitteredCodexResetUnixIsSameWindow`·
+  `testNextWindowWithJitterStillRearms`·`testRetryingAtLimitGrantsOnlyOnce`(문자열 비교 주입 시 4개 지급으로
+  실패 확인). 외부 API 의 시각 필드를 identity 로 쓸 땐 **실제 응답 두 개를 나란히 놓고** 흔들리는 자릿수를 먼저 본다.
+
 - **휘발성 필드를 dedup/identity 키에 쓰지 마라.** 매 fetch/refresh 마다 값이 변하는 필드(예: rolling
   한도 창의 `resets_at`)를 알림 중복방지 키에 넣으면 매번 새 키가 되어 dedup 이 무력화된다 — 주간 한도
   알림이 80·81·84…갱신마다 반복되던 회귀. 임계값 알림은 **엣지 트리거**(직전 tier 보다 높아진 순간만

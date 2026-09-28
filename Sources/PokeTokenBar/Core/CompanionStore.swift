@@ -1297,7 +1297,8 @@ final class CompanionStore {
     /// - 100% 미만 → 맵에서 제거(재무장).
     /// - 같은 key 라도 epoch(`resets_at`)가 바뀌면 새 창으로 보고 재무장 — 슬립·종료로 &lt;100% 샘플을
     ///   못 본 채 다시 100%만 관측해도 지급 누락이 없다(#326). key 자체엔 epoch 를 넣지 않는다
-    ///   (알림 dedup 과 같은 이유로 매 fetch 새 키 폭탄 방지).
+    ///   (알림 dedup 과 같은 이유로 매 fetch 새 키 폭탄 방지). epoch 비교는 `isNewCandyWindow` 로 —
+    ///   같은 창의 fetch 간 흔들림은 무시하고, 저장된 epoch 는 새 창일 때만 갱신한다.
     /// - 이미 지급한 창(tier≥1)은 재지급 안 함. session=1개·weekly=weeklyGrant.
     /// - 부수효과(인벤토리·알림)와 분리해 xctest 가능. (evaluateLimitAlerts 자매)
     static func evaluateCandyGrants(
@@ -1308,10 +1309,14 @@ final class CompanionStore {
         var grants: [CandyGrant] = []
         for w in windows {
             if let epoch = w.epoch {
-                if let previousEpoch = windowEpoch[w.key], previousEpoch != epoch {
-                    grantTier[w.key] = nil
+                if let previousEpoch = windowEpoch[w.key] {
+                    if isNewCandyWindow(previous: previousEpoch, current: epoch) {
+                        grantTier[w.key] = nil
+                        windowEpoch[w.key] = epoch
+                    }
+                } else {
+                    windowEpoch[w.key] = epoch
                 }
-                windowEpoch[w.key] = epoch
             }
             guard w.utilization >= 100 else { grantTier[w.key] = nil; continue }
             let previous = grantTier[w.key] ?? 0
@@ -1321,6 +1326,23 @@ final class CompanionStore {
             grants.append(CandyGrant(windowKey: w.key, windowName: w.name, count: count))
         }
         return grants
+    }
+
+    /// The same window does not keep a byte-identical epoch: Claude's `resets_at` carries the request's
+    /// microseconds (`…15:10:00.403883+00:00`) and Codex's reset unix drifts by a second. A string
+    /// compare re-armed on every fetch at 100% and granted again. Real window turnover moves the reset
+    /// by at least the shortest candy window (5h), so small shifts are the same window.
+    static let candyEpochTolerance: TimeInterval = 60 * 60
+
+    static func isNewCandyWindow(previous: String, current: String) -> Bool {
+        guard previous != current else { return false }
+        guard let a = candyEpochDate(previous), let b = candyEpochDate(current) else { return true }
+        return abs(b.timeIntervalSince(a)) > candyEpochTolerance
+    }
+
+    private static func candyEpochDate(_ epoch: String) -> Date? {
+        if let unix = TimeInterval(epoch) { return Date(timeIntervalSince1970: unix) }
+        return ISO8601Parser.date(from: epoch)
     }
 
     /// 한도 창 상태로부터 사탕 지급(엣지·영속). AppDelegate 가 매 refresh 완료 시(한도 로드 후) 호출.
